@@ -1,0 +1,162 @@
+---
+# -----------------------------------------------------------------------------
+# 1) ConfigMap containing the updated Python script (single‐endpoint + latency)
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tidb-perf-script-optimized
+  namespace: tidb
+data:
+  script.py: |
+    #!/usr/bin/env python3
+    import os
+    import time
+    import random
+    import string
+    import pymysql
+
+    # Read a single TiDB endpoint from an environment variable. Expected format: "hostname:port"
+    ENDPOINT = os.getenv("TIDB_ENDPOINT", "")
+    if not ENDPOINT:
+        raise RuntimeError("TIDB_ENDPOINT must be set (in host:port format)")
+
+    DB_USER = os.getenv("TIDB_USER", "root")
+    DB_PASS = os.getenv("TIDB_PASSWORD", "")
+    DB_NAME = os.getenv("TIDB_DATABASE", "test")
+    REGION = os.getenv("REGION", "es-mad")
+
+    # How long to sleep between each operation (in seconds)
+    OP_INTERVAL = float(os.getenv("OP_INTERVAL_SECONDS", "5"))
+
+    TABLE_NAME = "test_data_partitioned"
+
+    def parse_endpoint(endpoint):
+        """
+        Split "hostname:port" into (host, port)
+        """
+        parts = endpoint.split(":")
+        if len(parts) != 2:
+            raise RuntimeError(f"Endpoint '{endpoint}' is not in host:port format")
+        host, port_str = parts
+        return host, int(port_str)
+
+    def random_string(length=32):
+        return "".join(random.choices(string.ascii_letters + string.digits, k=length))
+
+    def perform_insert_and_select(endpoint):
+        """
+        Connects to the given endpoint, inserts one row, then measures latency
+        for insert and select operations.
+        """
+        host, port = parse_endpoint(endpoint)
+        conn = pymysql.connect(
+            host=host,
+            port=port,
+            user=DB_USER,
+            password=DB_PASS,
+            database=DB_NAME,
+            connect_timeout=10
+        )
+        with conn.cursor() as cur:
+            # 1) INSERT latency measurement
+            payload = random_string()
+            region  = REGION
+
+            insert_sql = f"INSERT INTO `{TABLE_NAME}` (region, payload) VALUES (%s, %s);"
+            start_insert = time.time()
+            cur.execute(insert_sql, (region, payload))
+            conn.commit()
+            end_insert = time.time()
+            insert_latency_ms = (end_insert - start_insert) * 1000.0
+
+            # Retrieve the auto-generated ID of the inserted row
+            last_id = cur.lastrowid
+
+            # 2) SELECT latency measurement (by id)
+            select_sql = f"SELECT id, region, payload, created_at FROM `{TABLE_NAME}` WHERE id = %s AND region = '`{region}`';"
+            start_select = time.time()
+            cur.execute(select_sql, (last_id,))
+            rows = cur.fetchall()
+            end_select = time.time()
+            select_latency_ms = (end_select - start_select) * 1000.0
+
+        conn.close()
+        return last_id, region, payload, insert_latency_ms, select_latency_ms, len(rows)
+
+    def main():
+
+        # 2) Enter an infinite loop: do insert + select + latency measurement, then sleep
+        count=0
+        while True:
+            try:
+                last_id, region, payload, ins_lat, sel_lat, row_count = perform_insert_and_select(ENDPOINT)
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"[{ts}] INSERT latency = {ins_lat:.2f} ms | "
+                    f"SELECT latency = {sel_lat:.2f} ms | "
+                    f"rows_found = {row_count} (id={last_id}, region='{region}', payload='{payload}') | "
+                    f"Total row count: {count}"
+                )
+                count=count+1
+            except Exception as e:
+                print(f"[ERROR] Operation on {ENDPOINT} failed: {e}")
+            time.sleep(OP_INTERVAL)
+
+    if __name__ == "__main__":
+        main()
+---
+# -----------------------------------------------------------------------------
+# 2) Deployment mounting that ConfigMap as a volume and running the updated script
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tidb-perf-deployment-optimized
+  namespace: tidb
+  labels:
+    app: tidb-perf
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tidb-perf
+  template:
+    metadata:
+      labels:
+        app: tidb-perf
+    spec:
+      containers:
+        - name: tidb-perf-tester
+          image: python:3.9-slim
+          command:
+            - sh
+            - -c
+            - |
+              pip install pymysql --no-cache-dir \
+              && /usr/local/bin/python /app/script.py
+          env:
+            # Replace with your actual TiDB instance hostnames/ports
+            - name: TIDB_ENDPOINT
+              value: "cluster-nl-ams-tidb.tidb.svc.cluster.local:4000"
+            - name: TIDB_USER
+              value: "root"
+            - name: TIDB_PASSWORD
+              value: ""
+            - name: TIDB_DATABASE
+              value: "demo_db"
+            - name: REGION
+              value: "nl-ams"
+            - name: OP_INTERVAL_SECONDS
+              value: "0.1"
+          volumeMounts:
+            - name: script-volume
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: script-volume
+          configMap:
+            name: tidb-perf-script-optimized
+            items:
+              - key: script.py
+                path: script.py
